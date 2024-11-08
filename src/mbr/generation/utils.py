@@ -68,6 +68,7 @@ class MBRGenerationMixin(GenerationMixin):
             metric_runner: Optional[MetricRunner] = None,
             logits_processor: Optional[LogitsProcessorList] = None,
             stopping_criteria: Optional[StoppingCriteriaList] = None,
+            stops: Optional[Union[str, List[str]]] = None,
             prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
             synced_gpus: Optional[bool] = None,
             assistant_model: Optional["PreTrainedModel"] = None,
@@ -431,8 +432,8 @@ class MBRGenerationMixin(GenerationMixin):
             for i in tqdm(list(range(mbr_config.num_samples)), disable=not progress_bar):
                 samples.append(self.sample(
                     input_ids,
-                    logits_processor=logits_processor,
-                    logits_warper=logits_warper,
+                    logits_processor=copy.deepcopy(logits_processor),
+                    logits_warper=copy.deepcopy(logits_warper),
                     stopping_criteria=copy.deepcopy(stopping_criteria),  # to prevent stopping criteria side effects
                     pad_token_id=generation_config.pad_token_id,
                     eos_token_id=generation_config.eos_token_id,
@@ -440,7 +441,7 @@ class MBRGenerationMixin(GenerationMixin):
                     return_dict_in_generate=generation_config.return_dict_in_generate,
                     synced_gpus=synced_gpus,
                     streamer=streamer,
-                    **model_kwargs,
+                    **copy.deepcopy(model_kwargs),
                 ))
 
             # 14. references
@@ -466,7 +467,7 @@ class MBRGenerationMixin(GenerationMixin):
                 for i in tqdm(list(range(mbr_config.num_references)), disable=not progress_bar):
                     references.append(self.sample(
                         input_ids,
-                        logits_processor=references_logits_processor,
+                        logits_processor=copy.deepcopy(references_logits_processor),
                         logits_warper=logits_warper,
                         stopping_criteria=copy.deepcopy(references_stopping_criteria),
                         pad_token_id=references_config.pad_token_id,
@@ -475,22 +476,51 @@ class MBRGenerationMixin(GenerationMixin):
                         return_dict_in_generate=references_config.return_dict_in_generate,
                         synced_gpus=synced_gpus,
                         streamer=streamer,
-                        **model_kwargs,
+                        **copy.deepcopy(model_kwargs),
                     ))
+
+        def extract_cont_tokens(samples):
+            res = []
+            for sample in samples:
+                # discard context + left-padding toks if using causal decoder-only LM
+                sample = sample[input_ids.shape[1] :]
+
+                s = tokenizer.decode(sample, skip_special_tokens=True)
+
+                # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+                for term in stops:
+                    if len(term) > 0:
+                        # ignore '' separator,
+                        # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
+                        s = s.split(term)[0]
+
+                res.append(s)
+            return res
+        
+    
+        sampled_continuations = [extract_cont_tokens(sample) for sample in samples]
+        references_continuations = [extract_cont_tokens(references) for references in references]
+
+        sampled_continuations = [tokenizer(sample, return_tensors="pt", padding=True, truncation=False).input_ids for sample in sampled_continuations]
+        references_continuations = [tokenizer(reference, return_tensors="pt", padding=True, truncation=False).input_ids for reference in references_continuations]
+
 
         # 15. apply metric to samples
         if metric_runner is None:
             metric_runner = load_metric_runner(mbr_config, tokenizer)
 
-        if isinstance(samples[0], ModelOutput):
-            sample_ids = tuple(sample.sequences for sample in samples)
-        else:
-            sample_ids = samples
-        if isinstance(references[0], ModelOutput):
-            reference_ids = tuple(reference.sequences for reference in references)
-        else:
-            reference_ids = references
 
+        # for metric we use only continuations(translation without prompts and extra tokens)
+        if isinstance(sampled_continuations[0], ModelOutput):
+            sample_ids = tuple(sample.sequences for sample in sampled_continuations)
+        else:
+            sample_ids = sampled_continuations
+
+        if isinstance(references_continuations[0], ModelOutput):
+            reference_ids = tuple(reference.sequences for reference in references_continuations)
+        else:
+            reference_ids = references_continuations
+        
         metric_output = metric_runner(input_ids, sample_ids, reference_ids)
         if not mbr_config.lower_is_better:
             top_metric_scores, top_metric_indices = metric_output.scores.max(dim=-1)
@@ -498,7 +528,7 @@ class MBRGenerationMixin(GenerationMixin):
             top_metric_scores, top_metric_indices = metric_output.scores.min(dim=-1)
 
         # Copy top samples into a tensor of shape (batch_size, max_length)
-        max_length = max(sample.shape[1] for sample in sample_ids)
+        max_length = max(sample.shape[1] for sample in samples)
         output = MBROutput(
             sequences=generation_config.pad_token_id * torch.ones((batch_size, max_length), dtype=torch.long),
             all_samples=(tuple(samples) if mbr_config.output_all_samples else None),
@@ -507,7 +537,7 @@ class MBRGenerationMixin(GenerationMixin):
             metric_scores=(metric_output if mbr_config.output_metric_scores else None),
         )
         for batch_idx, sample_idx in enumerate(top_metric_indices):
-            output.sequences[batch_idx][:sample_ids[sample_idx].shape[1]] = sample_ids[sample_idx][batch_idx]
+            output.sequences[batch_idx][:samples[sample_idx].shape[1]] = samples[sample_idx][batch_idx]
 
         if mbr_config.return_dict_in_generate:
             return output
