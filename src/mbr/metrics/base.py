@@ -4,14 +4,13 @@ from typing import Tuple, Union, List, Optional
 import evaluate
 import torch
 from cachetools.func import fifo_cache
-from datasets import Metric
 from evaluate import EvaluationModule
 from transformers import PreTrainedTokenizerBase
 from transformers.utils import ModelOutput
 
 from mbr import MBRConfig
 
-MetricType = Union[Metric, EvaluationModule]
+MetricType = Union[EvaluationModule]
 
 
 @dataclass

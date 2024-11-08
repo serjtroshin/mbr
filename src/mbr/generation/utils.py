@@ -433,7 +433,7 @@ class MBRGenerationMixin(GenerationMixin):
                     input_ids,
                     logits_processor=logits_processor,
                     logits_warper=logits_warper,
-                    stopping_criteria=stopping_criteria,
+                    stopping_criteria=copy.deepcopy(stopping_criteria),  # to prevent stopping criteria side effects
                     pad_token_id=generation_config.pad_token_id,
                     eos_token_id=generation_config.eos_token_id,
                     output_scores=generation_config.output_scores,
@@ -468,7 +468,7 @@ class MBRGenerationMixin(GenerationMixin):
                         input_ids,
                         logits_processor=references_logits_processor,
                         logits_warper=logits_warper,
-                        stopping_criteria=references_stopping_criteria,
+                        stopping_criteria=copy.deepcopy(references_stopping_criteria),
                         pad_token_id=references_config.pad_token_id,
                         eos_token_id=references_config.eos_token_id,
                         output_scores=references_config.output_scores,
